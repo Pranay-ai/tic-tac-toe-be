@@ -2,32 +2,38 @@ package main
 
 import (
 	"context"
-	"flag"
 	"log"
 	"net/http"
+	"os"
+
+	"github.com/rs/cors" // Corrected import path
 )
 
-var addr = flag.String("addr", ":8080", "http service address")
-
 func main() {
-	flag.Parse()
-	// We will create the hub here later
 	initRedis()
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+		log.Println("PORT not set, defaulting to 8080")
+	}
+
 	hub := newHub()
 	go hub.run()
-
 	go startMatchmaking(hub)
+	go subscribeToGameUpdates(context.Background(), hub)
 
-	go subscribeToGameUpdates(context.Background(), hub) // Add this
-
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		// We will pass the hub in here later
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		serveWs(hub, w, r)
-		log.Println("New connection attempt to /ws")
 	})
 
-	log.Println("Server starting on", *addr)
-	err := http.ListenAndServe(*addr, nil)
+	// Add the CORS middleware to allow connections from your frontend
+	handler := cors.Default().Handler(mux)
+
+	serverAddr := ":" + port
+	log.Println("Server starting on", serverAddr)
+	err := http.ListenAndServe(serverAddr, handler)
 	if err != nil {
 		log.Fatal("ListenAndServe: ", err)
 	}

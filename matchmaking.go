@@ -8,113 +8,121 @@ import (
 	"github.com/google/uuid"
 )
 
-// The key for our Redis list that acts as the matchmaking queue.
 const matchmakingQueueKey = "matchmaking:queue"
+const inQueueKey = "matchmaking:in_queue"
+const inGameKey = "players_in_game"
+const playerNamesKey = "player:names"
 
-// handleFindMatch adds a client's ID to the matchmaking queue in Redis.
-func handleFindMatch(client *Client) {
-	log.Printf("Client %s is looking for a match", client.ID)
-
-	// Check if the player is already in the queue to prevent duplicates.
-	// This is an optional but good practice.
-	// For simplicity in this step, we will assume no duplicates.
-
-	// LPUSH adds the client's ID to the left (front) of the list.
-	err := rdb.LPush(ctx, matchmakingQueueKey, client.ID).Err()
-	if err != nil {
-		log.Printf("Error adding client %s to matchmaking queue: %v", client.ID, err)
+func handleFindMatch(client *Client, payload interface{}) {
+	payloadData, _ := json.Marshal(payload)
+	var findMatchPayload FindMatchPayload
+	if err := json.Unmarshal(payloadData, &findMatchPayload); err != nil {
+		log.Printf("Error unmarshalling find_match payload: %v", err)
+		return
 	}
+
+	client.PlayerID = findMatchPayload.PlayerID
+	client.PlayerName = findMatchPayload.PlayerName
+
+	rdb.HSet(ctx, playerNamesKey, client.PlayerID, client.PlayerName)
+
+	isAlreadyInGame, _ := rdb.SIsMember(ctx, inGameKey, client.PlayerID).Result()
+	if isAlreadyInGame {
+		log.Printf("Player %s tried to queue while already in a game.", client.PlayerID)
+		return
+	}
+
+	isAlreadyInQueue, _ := rdb.SIsMember(ctx, inQueueKey, client.PlayerID).Result()
+	if isAlreadyInQueue {
+		log.Printf("Player %s is already in the matchmaking queue.", client.PlayerID)
+		return
+	}
+
+	if err := rdb.SAdd(ctx, inQueueKey, client.PlayerID).Err(); err != nil {
+		log.Printf("Error adding player to in_queue set: %v", err)
+		return
+	}
+
+	if err := rdb.LPush(ctx, matchmakingQueueKey, client.PlayerID).Err(); err != nil {
+		log.Printf("Error adding client to matchmaking queue: %v", err)
+		rdb.SRem(ctx, inQueueKey, client.PlayerID)
+		return
+	}
+
+	log.Printf("Player %s (Name: %s) successfully added to matchmaking queue.", client.PlayerID, client.PlayerName)
 }
 
-// startMatchmaking runs a background process that continuously checks the queue for pairs of players.
 func startMatchmaking(hub *Hub) {
-	// A ticker sends a signal ("tick") on a channel at a regular interval.
-	// This is an efficient way to run a recurring background task.
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
-	// This `for` loop waits for the next tick from the ticker.
 	for range ticker.C {
-		// Check the number of players waiting in the queue.
-		queueLength, err := rdb.LLen(ctx, matchmakingQueueKey).Result()
-		if err != nil {
-			log.Printf("Error getting matchmaking queue length: %v", err)
-			continue // Skip this tick if we can't check the queue.
-		}
+		pipe := rdb.TxPipeline()
+		queueLength := pipe.LLen(ctx, matchmakingQueueKey)
+		pipe.Exec(ctx)
 
-		// If there are at least two players, we can make a match.
-		if queueLength >= 2 {
-			// RPOP removes and returns the right-most (oldest) element from the list.
+		if queueLength.Val() >= 2 {
+			log.Println("Attempting to create a match...")
 			player1ID, err1 := rdb.RPop(ctx, matchmakingQueueKey).Result()
 			player2ID, err2 := rdb.RPop(ctx, matchmakingQueueKey).Result()
 
 			if err1 != nil || err2 != nil {
 				log.Printf("Error popping players from matchmaking queue: %v, %v", err1, err2)
-				// If we successfully popped one player but failed on the second, we should push the first one back.
 				if err1 == nil {
 					rdb.LPush(ctx, matchmakingQueueKey, player1ID)
 				}
 				continue
 			}
 
+			rdb.SRem(ctx, inQueueKey, player1ID, player2ID)
+			rdb.SAdd(ctx, inGameKey, player1ID, player2ID)
+
 			log.Printf("Match found! Pairing Player X (%s) and Player O (%s)", player1ID, player2ID)
 
-			// Find the actual Client objects in the hub using their IDs.
-			client1, ok1 := hub.clients[player1ID]
-			client2, ok2 := hub.clients[player2ID]
-
-			if !ok1 || !ok2 {
-				log.Println("Matchmaking failed: one or both clients disconnected before match could be made.")
-				// If one client is still connected, we can add them back to the queue.
-				if ok1 {
-					handleFindMatch(client1)
+			var client1, client2 *Client
+			for _, client := range hub.clients {
+				if client.PlayerID == player1ID {
+					client1 = client
 				}
-				if ok2 {
-					handleFindMatch(client2)
+				if client.PlayerID == player2ID {
+					client2 = client
+				}
+			}
+
+			if client1 == nil || client2 == nil {
+				log.Println("Matchmaking failed: one or more clients disconnected. Rolling back.")
+				rdb.SRem(ctx, inGameKey, player1ID, player2ID)
+				if client1 != nil {
+					rdb.SAdd(ctx, inQueueKey, client1.PlayerID)
+					rdb.LPush(ctx, matchmakingQueueKey, client1.PlayerID)
+				}
+				if client2 != nil {
+					rdb.SAdd(ctx, inQueueKey, client2.PlayerID)
+					rdb.LPush(ctx, matchmakingQueueKey, client2.PlayerID)
 				}
 				continue
 			}
 
-			// Create a new game for the matched players.
 			newGame := &Game{
-				ID:      uuid.NewString(),
-				PlayerX: player1ID,
-				PlayerO: player2ID,
-				Board:   [9]string{}, // Board is initially empty.
-				Turn:    "X",         // Player X always goes first.
-				Status:  StatusPlaying,
+				ID:          uuid.NewString(),
+				PlayerX:     player1ID,
+				PlayerO:     player2ID,
+				PlayerXName: client1.PlayerName,
+				PlayerOName: client2.PlayerName,
+				Board:       [9]string{},
+				Turn:        "X",
+				Status:      StatusPlaying,
 			}
 
-			// Save the initial state of the new game to Redis.
-			if err := saveGame(ctx, newGame); err != nil {
-				log.Printf("Error creating new game for %s and %s: %v", player1ID, player2ID, err)
-				continue
-			}
+			saveGame(ctx, newGame)
 
-			// Associate the game ID with each client struct.
-			// This is important for future operations, like handling disconnects.
 			client1.GameID = newGame.ID
 			client2.GameID = newGame.ID
 
-			// Prepare the "match_found" notification message.
-			response := Message{
-				Type: "match_found",
-				Payload: MatchFoundPayload{
-					GameID:  newGame.ID,
-					PlayerX: newGame.PlayerX,
-					PlayerO: newGame.PlayerO,
-				},
-			}
-
-			responseJSON, err := json.Marshal(response)
-			if err != nil {
-				log.Printf("Error marshalling match_found response: %v", err)
-				continue
-			}
-
-			// Send the notification directly to each of the two matched players.
-			hub.direct <- &directMessage{clientID: player1ID, message: responseJSON}
-			hub.direct <- &directMessage{clientID: player2ID, message: responseJSON}
+			response := Message{Type: "match_found", Payload: newGame}
+			responseJSON, _ := json.Marshal(response)
+			hub.direct <- &directMessage{playerID: client1.PlayerID, message: responseJSON}
+			hub.direct <- &directMessage{playerID: client2.PlayerID, message: responseJSON}
 		}
 	}
 }
