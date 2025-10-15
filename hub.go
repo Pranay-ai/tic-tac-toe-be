@@ -4,7 +4,6 @@ import (
 	"log"
 )
 
-// A message intended for a specific player.
 type directMessage struct {
 	playerID string
 	message  []byte
@@ -27,36 +26,52 @@ func newHub() *Hub {
 }
 
 func (h *Hub) run() {
+	log.Println("[HUB] Hub is running...")
 	for {
 		select {
 		case client := <-h.register:
 			h.clients[client.ID] = client
-			log.Printf("Client %s connected. Total clients: %d", client.ID, len(h.clients))
+			log.Printf("[HUB] Client %s registered. Total clients: %d", client.ID, len(h.clients))
+
 		case client := <-h.unregister:
 			if _, ok := h.clients[client.ID]; ok {
-				// If the disconnecting client had a PlayerID, remove them from the queue.
+				log.Printf("[HUB] Unregistering client %s (PlayerID: %s)", client.ID, client.PlayerID)
+
+				if client.GameID != "" {
+					log.Printf("[HUB] In-game player %s disconnected from game %s. Starting forfeit timer.", client.PlayerID, client.GameID)
+					go handleGameDisconnect(client.PlayerID, client.GameID)
+				}
+
 				if client.PlayerID != "" {
 					rdb.LRem(ctx, matchmakingQueueKey, 0, client.PlayerID)
 					rdb.SRem(ctx, inQueueKey, client.PlayerID)
-					log.Printf("Player %s removed from matchmaking queue due to disconnect.", client.PlayerID)
+					log.Printf("[HUB] Player %s removed from matchmaking queue due to disconnect.", client.PlayerID)
 				}
 
 				delete(h.clients, client.ID)
 				close(client.send)
-				log.Printf("Client %s disconnected. Total clients: %d", client.ID, len(h.clients))
+				log.Printf("[HUB] Client %s connection closed. Total clients: %d", client.ID, len(h.clients))
 			}
+
 		case dm := <-h.direct:
-			// Loop through all connected clients to find the recipient by their PlayerID.
+			log.Printf("[HUB] Routing direct message to PlayerID: %s", dm.playerID)
+			var foundClient bool
 			for _, client := range h.clients {
 				if client.PlayerID == dm.playerID {
 					select {
 					case client.send <- dm.message:
+						log.Printf("[HUB] Message sent successfully to PlayerID: %s (ConnectionID: %s)", dm.playerID, client.ID)
 					default:
+						log.Printf("[HUB] Send buffer full for PlayerID: %s. Closing connection.", dm.playerID)
 						close(client.send)
 						delete(h.clients, client.ID)
 					}
-					break // Found the client, no need to check others.
+					foundClient = true
+					break
 				}
+			}
+			if !foundClient {
+				log.Printf("[HUB] Could not find an active client for PlayerID: %s", dm.playerID)
 			}
 		}
 	}

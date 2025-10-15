@@ -13,13 +13,15 @@ type LeaderboardEntry struct {
 }
 
 func updateLeaderboard(winnerID string) {
+	log.Printf("[LEADERBOARD] Incrementing score for winner ID: %s", winnerID)
 	_, err := rdb.ZIncrBy(context.Background(), leaderboardKey, 1, winnerID).Result()
 	if err != nil {
-		log.Printf("Error updating leaderboard: %v", err)
+		log.Printf("[LEADERBOARD] Error updating leaderboard: %v", err)
 	}
 }
 
 func getLeaderboard() ([]LeaderboardEntry, error) {
+	log.Println("[LEADERBOARD] Fetching top 10 scores.")
 	idScores, err := rdb.ZRevRangeWithScores(context.Background(), leaderboardKey, 0, 9).Result()
 	if err != nil {
 		return nil, err

@@ -12,5 +12,10 @@ type MovePayload struct {
 
 type FindMatchPayload struct {
 	PlayerID   string `json:"playerId"`
-	PlayerName string `json:"playerName"`
+	PlayerName string `json.com:"playerName"`
+}
+
+type ReconnectPayload struct {
+	PlayerID string `json:"playerId"`
+	GameID   string `json:"gameId"`
 }

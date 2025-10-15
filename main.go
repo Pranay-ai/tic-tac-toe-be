@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/rs/cors" // Corrected import path
+	"github.com/rs/cors"
 )
 
 func main() {
@@ -15,8 +15,8 @@ func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
-		log.Println("PORT not set, defaulting to 8080")
 	}
+	log.Printf("[MAIN] PORT not set, defaulting to %s", port)
 
 	hub := newHub()
 	go hub.run()
@@ -28,13 +28,12 @@ func main() {
 		serveWs(hub, w, r)
 	})
 
-	// Add the CORS middleware to allow connections from your frontend
 	handler := cors.Default().Handler(mux)
 
 	serverAddr := ":" + port
-	log.Println("Server starting on", serverAddr)
+	log.Println("[MAIN] Server starting on", serverAddr)
 	err := http.ListenAndServe(serverAddr, handler)
 	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
+		log.Fatal("[MAIN] ListenAndServe Error: ", err)
 	}
 }

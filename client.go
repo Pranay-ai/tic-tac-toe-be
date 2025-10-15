@@ -29,7 +29,7 @@ type Client struct {
 func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println(err)
+		log.Printf("[CLIENT] Error upgrading connection: %v", err)
 		return
 	}
 	client := &Client{
@@ -38,6 +38,7 @@ func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		conn: conn,
 		send: make(chan []byte, 256),
 	}
+	log.Printf("[CLIENT] New WebSocket connection established with ID: %s", client.ID)
 	client.hub.register <- client
 
 	go client.writePump()
@@ -53,17 +54,19 @@ func (c *Client) readPump() {
 		_, rawMessage, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("error: %v", err)
+				log.Printf("[CLIENT] readPump error: %v", err)
 			}
 			break
 		}
+		log.Printf("[CLIENT] Received raw message from %s: %s", c.ID, string(rawMessage))
 
 		var msg Message
 		if err := json.Unmarshal(rawMessage, &msg); err != nil {
-			log.Printf("error unmarshalling message: %v", err)
+			log.Printf("[CLIENT] Error unmarshalling message: %v", err)
 			continue
 		}
 
+		log.Printf("[CLIENT] Parsed message type '%s' from client %s", msg.Type, c.ID)
 		switch msg.Type {
 		case "move":
 			handleMove(c, msg.Payload)
@@ -71,8 +74,10 @@ func (c *Client) readPump() {
 			handleFindMatch(c, msg.Payload)
 		case "get_leaderboard":
 			handleGetLeaderboard(c)
+		case "reconnect":
+			handleReconnect(c, msg.Payload)
 		default:
-			log.Printf("unknown message type received: %s", msg.Type)
+			log.Printf("[CLIENT] Unknown message type received: %s", msg.Type)
 		}
 	}
 }
@@ -86,33 +91,70 @@ func (c *Client) writePump() {
 		case message, ok := <-c.send:
 			if !ok {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				log.Printf("[CLIENT] writePump: Hub closed channel for client %s.", c.ID)
 				return
 			}
+			log.Printf("[CLIENT] Sending message to client %s (PlayerID: %s): %s", c.ID, c.PlayerID, string(message))
 			c.conn.WriteMessage(websocket.TextMessage, message)
 		}
 	}
 }
 
+func handleReconnect(client *Client, payload interface{}) {
+	log.Printf("[RECONNECT] Handling reconnect request...")
+	var reconnectPayload ReconnectPayload
+	payloadData, _ := json.Marshal(payload)
+	json.Unmarshal(payloadData, &reconnectPayload)
+
+	client.PlayerID = reconnectPayload.PlayerID
+	client.GameID = reconnectPayload.GameID
+
+	log.Printf("[RECONNECT] Player %s attempting to reconnect to game %s", client.PlayerID, client.GameID)
+
+	game, err := getGame(ctx, client.GameID)
+	if err != nil || game == nil {
+		log.Printf("[RECONNECT] Failed: Game %s not found.", client.GameID)
+		return
+	}
+
+	isValidReconnect := (game.PlayerX == client.PlayerID && game.Status == StatusDisconnectedX) ||
+		(game.PlayerO == client.PlayerID && game.Status == StatusDisconnectedO)
+
+	if isValidReconnect {
+		log.Printf("[RECONNECT] Player %s reconnected successfully to game %s.", client.PlayerID, client.GameID)
+		game.Status = StatusPlaying
+		saveGame(ctx, game)
+
+		response := Message{Type: "game_update", Payload: game}
+		responseJSON, _ := json.Marshal(response)
+		channel := "game:" + game.ID
+		rdb.Publish(ctx, channel, responseJSON)
+	} else {
+		log.Printf("[RECONNECT] Invalid reconnect attempt by Player %s for game %s with status %s.", client.PlayerID, client.GameID, game.Status)
+	}
+}
+
 func handleMove(client *Client, payload interface{}) {
+	log.Printf("[MOVE] Handling move request from PlayerID: %s", client.PlayerID)
 	moveData, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("error marshalling move payload: %v", err)
+		log.Printf("[MOVE] error marshalling move payload: %v", err)
 		return
 	}
 	var move MovePayload
 	if err := json.Unmarshal(moveData, &move); err != nil {
-		log.Printf("error unmarshalling move payload: %v", err)
+		log.Printf("[MOVE] error unmarshalling move payload: %v", err)
 		return
 	}
 
 	ctx := context.Background()
 	game, err := getGame(ctx, move.GameID)
 	if err != nil {
-		log.Printf("error getting game: %v", err)
+		log.Printf("[MOVE] error getting game: %v", err)
 		return
 	}
 	if game == nil {
-		log.Printf("game not found: %s", move.GameID)
+		log.Printf("[MOVE] game not found: %s", move.GameID)
 		return
 	}
 
@@ -122,30 +164,30 @@ func handleMove(client *Client, payload interface{}) {
 	} else if client.PlayerID == game.PlayerO {
 		currentPlayerSymbol = "O"
 	} else {
-		log.Printf("validation failed: client connection %s (PlayerID: %s) is not a player in game %s", client.ID, client.PlayerID, game.ID)
+		log.Printf("[MOVE] validation failed: client (PlayerID: %s) is not a player in game %s", client.PlayerID, game.ID)
 		return
 	}
 
 	if game.Status != StatusPlaying {
-		log.Println("validation failed: game is already over")
+		log.Printf("[MOVE] validation failed: game is already over (status: %s)", game.Status)
 		return
 	}
 	if game.Turn != currentPlayerSymbol {
-		log.Printf("validation failed: not player %s's turn", currentPlayerSymbol)
+		log.Printf("[MOVE] validation failed: not player %s's turn", currentPlayerSymbol)
 		return
 	}
 	if move.Index < 0 || move.Index > 8 || game.Board[move.Index] != "" {
-		log.Printf("validation failed: cell %d is invalid or not empty", move.Index)
+		log.Printf("[MOVE] validation failed: cell %d is invalid or not empty", move.Index)
 		return
 	}
 
 	game.applyMove(move.Index, currentPlayerSymbol)
 
 	if game.Status == StatusWinX {
-		updateLeaderboard(game.PlayerX) // Use PlayerX (the ID)
+		updateLeaderboard(game.PlayerX)
 		rdb.SRem(ctx, inGameKey, game.PlayerX, game.PlayerO)
 	} else if game.Status == StatusWinO {
-		updateLeaderboard(game.PlayerO) // Use PlayerO (the ID)
+		updateLeaderboard(game.PlayerO)
 		rdb.SRem(ctx, inGameKey, game.PlayerX, game.PlayerO)
 	} else if game.Status == StatusDraw {
 		rdb.SRem(ctx, inGameKey, game.PlayerX, game.PlayerO)
@@ -158,10 +200,10 @@ func handleMove(client *Client, payload interface{}) {
 	}
 
 	if err := saveGame(ctx, game); err != nil {
-		log.Printf("error saving game: %v", err)
+		log.Printf("[MOVE] error saving game: %v", err)
 		return
 	}
-	log.Printf("move successful on game %s by player %s", game.ID, currentPlayerSymbol)
+	log.Printf("[MOVE] move successful on game %s by player %s", game.ID, currentPlayerSymbol)
 
 	response := Message{
 		Type:    "game_update",
@@ -169,20 +211,21 @@ func handleMove(client *Client, payload interface{}) {
 	}
 	responseJSON, err := json.Marshal(response)
 	if err != nil {
-		log.Printf("error marshalling game update: %v", err)
+		log.Printf("[MOVE] error marshalling game update: %v", err)
 		return
 	}
 
 	channel := "game:" + game.ID
 	if err := rdb.Publish(ctx, channel, responseJSON).Err(); err != nil {
-		log.Printf("error publishing game update: %v", err)
+		log.Printf("[MOVE] error publishing game update: %v", err)
 	}
 }
 
 func handleGetLeaderboard(client *Client) {
+	log.Printf("[LEADERBOARD] Handling get_leaderboard request from PlayerID: %s", client.PlayerID)
 	scores, err := getLeaderboard()
 	if err != nil {
-		log.Printf("Error getting leaderboard: %v", err)
+		log.Printf("[LEADERBOARD] Error getting leaderboard: %v", err)
 		return
 	}
 

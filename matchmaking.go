@@ -17,42 +17,43 @@ func handleFindMatch(client *Client, payload interface{}) {
 	payloadData, _ := json.Marshal(payload)
 	var findMatchPayload FindMatchPayload
 	if err := json.Unmarshal(payloadData, &findMatchPayload); err != nil {
-		log.Printf("Error unmarshalling find_match payload: %v", err)
+		log.Printf("[MATCHMAKING] Error unmarshalling find_match payload: %v", err)
 		return
 	}
 
 	client.PlayerID = findMatchPayload.PlayerID
 	client.PlayerName = findMatchPayload.PlayerName
-
+	log.Printf("[MATCHMAKING] Handling find_match from PlayerID: %s, PlayerName: %s", client.PlayerID, client.PlayerName)
 	rdb.HSet(ctx, playerNamesKey, client.PlayerID, client.PlayerName)
 
 	isAlreadyInGame, _ := rdb.SIsMember(ctx, inGameKey, client.PlayerID).Result()
 	if isAlreadyInGame {
-		log.Printf("Player %s tried to queue while already in a game.", client.PlayerID)
+		log.Printf("[MATCHMAKING] REJECTED: Player %s tried to queue while already in a game.", client.PlayerID)
 		return
 	}
 
 	isAlreadyInQueue, _ := rdb.SIsMember(ctx, inQueueKey, client.PlayerID).Result()
 	if isAlreadyInQueue {
-		log.Printf("Player %s is already in the matchmaking queue.", client.PlayerID)
+		log.Printf("[MATCHMAKING] REJECTED: Player %s is already in the matchmaking queue.", client.PlayerID)
 		return
 	}
 
 	if err := rdb.SAdd(ctx, inQueueKey, client.PlayerID).Err(); err != nil {
-		log.Printf("Error adding player to in_queue set: %v", err)
+		log.Printf("[MATCHMAKING] Error adding player to in_queue set: %v", err)
 		return
 	}
 
 	if err := rdb.LPush(ctx, matchmakingQueueKey, client.PlayerID).Err(); err != nil {
-		log.Printf("Error adding client to matchmaking queue: %v", err)
+		log.Printf("[MATCHMAKING] Error adding client to matchmaking queue: %v", err)
 		rdb.SRem(ctx, inQueueKey, client.PlayerID)
 		return
 	}
 
-	log.Printf("Player %s (Name: %s) successfully added to matchmaking queue.", client.PlayerID, client.PlayerName)
+	log.Printf("[MATCHMAKING] Player %s (Name: %s) successfully added to matchmaking queue.", client.PlayerID, client.PlayerName)
 }
 
 func startMatchmaking(hub *Hub) {
+	log.Println("[MATCHMAKING] Matchmaking service started...")
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -62,12 +63,12 @@ func startMatchmaking(hub *Hub) {
 		pipe.Exec(ctx)
 
 		if queueLength.Val() >= 2 {
-			log.Println("Attempting to create a match...")
+			log.Printf("[MATCHMAKING] Ticker found %d players in queue. Attempting to create a match...", queueLength.Val())
 			player1ID, err1 := rdb.RPop(ctx, matchmakingQueueKey).Result()
 			player2ID, err2 := rdb.RPop(ctx, matchmakingQueueKey).Result()
 
 			if err1 != nil || err2 != nil {
-				log.Printf("Error popping players from matchmaking queue: %v, %v", err1, err2)
+				log.Printf("[MATCHMAKING] Error popping players from queue: %v, %v", err1, err2)
 				if err1 == nil {
 					rdb.LPush(ctx, matchmakingQueueKey, player1ID)
 				}
@@ -76,8 +77,7 @@ func startMatchmaking(hub *Hub) {
 
 			rdb.SRem(ctx, inQueueKey, player1ID, player2ID)
 			rdb.SAdd(ctx, inGameKey, player1ID, player2ID)
-
-			log.Printf("Match found! Pairing Player X (%s) and Player O (%s)", player1ID, player2ID)
+			log.Printf("[MATCHMAKING] SUCCESS: Match found! Pairing Player X (%s) and Player O (%s)", player1ID, player2ID)
 
 			var client1, client2 *Client
 			for _, client := range hub.clients {
@@ -90,7 +90,7 @@ func startMatchmaking(hub *Hub) {
 			}
 
 			if client1 == nil || client2 == nil {
-				log.Println("Matchmaking failed: one or more clients disconnected. Rolling back.")
+				log.Println("[MATCHMAKING] FAILED: One or both clients disconnected. Rolling back.")
 				rdb.SRem(ctx, inGameKey, player1ID, player2ID)
 				if client1 != nil {
 					rdb.SAdd(ctx, inQueueKey, client1.PlayerID)
@@ -115,7 +115,6 @@ func startMatchmaking(hub *Hub) {
 			}
 
 			saveGame(ctx, newGame)
-
 			client1.GameID = newGame.ID
 			client2.GameID = newGame.ID
 

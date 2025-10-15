@@ -7,15 +7,16 @@ import (
 )
 
 func subscribeToGameUpdates(ctx context.Context, hub *Hub) {
+	log.Println("[PUBSUB] Subscribing to game update channels (game:*)")
 	pubsub := rdb.PSubscribe(ctx, "game:*")
 	defer pubsub.Close()
-	ch := pubsub.Channel()
-	log.Println("Subscribed to game update channels")
 
+	ch := pubsub.Channel()
 	for msg := range ch {
+		log.Printf("[PUBSUB] Received message from Redis on channel %s", msg.Channel)
 		var gameUpdate Message
 		if err := json.Unmarshal([]byte(msg.Payload), &gameUpdate); err != nil {
-			log.Printf("Error unmarshalling game update: %v", err)
+			log.Printf("[PUBSUB] Error unmarshalling game update: %v", err)
 			continue
 		}
 
