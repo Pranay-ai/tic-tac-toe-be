@@ -1,73 +1,56 @@
 # Tic-Tac-Toe Backend
 
-Real-time WebSocket backend that matches players, persists game state, and broadcasts updates for a multiplayer Tic-Tac-Toe experience. The service is written in Go, uses Redis for state, matchmaking, and pub/sub, and is ready to run locally or inside a container.
+Real-time WebSocket backend for multiplayer Tic-Tac-Toe. The service is written in Go, keeps all state in Redis, and exposes a single `/ws` endpoint for gameplay events, matchmaking, and leaderboard updates.
 
-## Features
-- Real-time gameplay over a single `/ws` WebSocket endpoint
-- Redis-backed matchmaking queue, game persistence, and pub/sub fan-out
-- Automatic leaderboard tracking driven by completed matches
-- Minimal deployment surface: single Go binary with optional Docker image
+## Highlights
+- Go 1.24+ WebSocket server that multiplexes all client actions through `client.go`
+- Redis-backed matchmaking queue, in-game tracking, and game persistence (`matchmaking.go`, `game.go`, `redis.go`)
+- Pub/Sub fan-out so both players receive the same update stream (`pubsub.go`)
+- Automatic leaderboard stored as a sorted set (`leaderboard.go`)
+- Ships as a single binary or minimal Docker image (`Dockerfile`)
 
-## Prerequisites
-- Go 1.24 or newer
-- A Redis instance accessible to the server
-- (Optional) Docker if you prefer running the pre-built container image
+## System Architecture
+The backend runs as one process but is split into focused components that communicate via channels and Redis.
 
-## Configuration
-Set the following environment variables before starting the server:
-- `REDIS_URL`: Connection string passed to `redis.ParseURL`, e.g. `redis://localhost:6379`
-- `PORT`: HTTP port for the WebSocket server (defaults to `8080`)
+**Runtime services (`main.go`):**
+- `Hub` (`hub.go`) keeps track of WebSocket clients, handles registration/unregistration, and routes direct messages by player ID.
+- `Client` (`client.go`) owns the WebSocket connection. `readPump` unmarshals messages into the shared `Message` envelope (`message.go`) and hands them to domain handlers. `writePump` streams responses back.
+- Matchmaking loop (`startMatchmaking` in `matchmaking.go`) polls Redis every 3 seconds, pairs players, instantiates a new `Game`, and notifies them via the hub.
+- Game services (`game.go`) enforce Tic-Tac-Toe rules, persist the board, and manage disconnect-forfeit timers.
+- Leaderboard utilities (`leaderboard.go`) increment win counts and hydrate player display names.
+- Redis subscriber (`pubsub.go`) listens to `game:*` channels and rebroadcasts updates through the hub so reconnects and multi-device clients stay in sync.
 
-When no `REDIS_URL` is supplied the app logs a fallback to `localhost:6379`, but supplying an explicit `redis://...` URL is recommended.
+**Primary data flows:**
+1. Client opens `/ws`; `serveWs` upgrades the connection and registers a `Client` with the `Hub`.
+2. `find_match` pushes the player ID into the Redis queue and marks them as queued. Once paired, matchmaking creates a `Game`, saves it, and notifies both players with `match_found`.
+3. Players take turns sending `move` messages. `handleMove` validates turn order and board state, persists the new board, and publishes a `game_update` via Redis.
+4. The Redis pub/sub listener forwards the same `game_update` payload to both participants through the hub, ensuring they receive identical state whether they are currently connected or reconnecting.
+5. When a game ends, the winner’s score increments in the `leaderboard:wins` sorted set and the players are removed from the `players_in_game` guard set.
+6. Disconnects trigger a 30-second timer. If the player fails to reconnect (`handleReconnect`), the opponent is awarded the win.
 
-## Run Locally
-```bash
-export REDIS_URL=redis://localhost:6379
-export PORT=8080
-
-go run ./...
-```
-The server listens on `http://localhost:8080` and upgrades WebSocket connections at `/ws`.
-
-To build a binary:
-```bash
-go build -o tic-tac-toe-be
-./tic-tac-toe-be
-```
-
-## Docker Workflow
-```bash
-docker build -t tic-tac-toe-be .
-
-docker run --rm \
-  -p 8080:8080 \
-  -e REDIS_URL=redis://host.docker.internal:6379 \
-  tic-tac-toe-be
-```
-Adjust the Redis host to match your environment (e.g. `redis://redis:6379` when running alongside a Redis container).
+## Data Model
+- **Game (`game.go`)** stored at `game:<uuid>` as JSON with fields `playerX`, `playerO`, `board[9]`, `turn`, and `status` (`playing`, `win_x`, `win_o`, `draw`, `disconnected_x`, `disconnected_o`).
+- **Redis keys (`matchmaking.go`, `leaderboard.go`):**
+  - `matchmaking:queue` (list) – FIFO queue of player IDs waiting for a match
+  - `matchmaking:in_queue` (set) – quick containment checks to prevent double-queueing
+  - `players_in_game` (set) – prevents a player from joining while already in a game
+  - `player:names` (hash) – `playerID -> display name` for leaderboard hydration
+  - `leaderboard:wins` (sorted set) – win counts keyed by player ID
 
 ## WebSocket API
-- **Endpoint**: `ws://<host>:<port>/ws`
-- Messages are JSON objects with a `type` string and a `payload` object.
+- **Endpoint:** `ws://<host>:<port>/ws`
+- **Envelope:** every message is `{"type": "<event>", "payload": <object|array|primitive>}`
 
-### Client → Server Messages
-- `find_match`
-  ```json
-  {"type": "find_match", "payload": {"playerId": "player-123", "playerName": "Jane"}}
-  ```
-- `move`
-  ```json
-  {"type": "move", "payload": {"gameId": "game-uuid", "index": 4}}
-  ```
-- `get_leaderboard`
-  ```json
-  {"type": "get_leaderboard", "payload": {}}
-  ```
+**Client → Server**
+- `find_match` → `{ "playerId": "p-123", "playerName": "Jane" }`
+- `move` → `{ "gameId": "game-uuid", "index": 4 }`
+- `get_leaderboard` → `{}`
+- `reconnect` → `{ "playerId": "p-123", "gameId": "game-uuid" }`
 
-### Server → Client Messages
-- `match_found`: Broadcast when two queued players are paired. Payload mirrors the `Game` schema below.
-- `game_update`: Sent after every valid move and on game completion.
-- `leaderboard_update`: Returns the top leaderboard entries on request.
+**Server → Client**
+- `match_found` – emitted once per pairing, payload is the full `Game` struct
+- `game_update` – after every valid move, reconnect, or disconnect timer resolution
+- `leaderboard_update` – sorted list of `{ "name": string, "score": number }`
 
 Example `game_update` payload:
 ```json
@@ -85,28 +68,47 @@ Example `game_update` payload:
   }
 }
 ```
-`status` transitions through `playing`, `win_x`, `win_o`, or `draw`.
 
-## Game Flow & Persistence
-- Matchmaking places players into a Redis list/sets (`matchmaking:queue`, `matchmaking:in_queue`, `players_in_game`).
-- When two players are paired, a new `Game` record is stored at `game:<id>`.
-- Moves are validated server-side, applied to the board, and persisted back to Redis.
-- Completed games update the `leaderboard:wins` sorted set; display names are cached under `player:names`.
-- Game updates are published through Redis pub/sub and routed to both participants.
+## Setup
+### Prerequisites
+- Go 1.24 or newer
+- Redis 6+ reachable from the server
+- (Optional) Docker for containerized runs
 
-## Project Layout
-- `main.go`: Program entrypoint, HTTP server, and middleware wiring.
-- `client.go`: WebSocket lifecycle, message routing, and move handling.
-- `matchmaking.go`: Redis-backed matchmaking loop.
-- `game.go`: Game domain model, rules, and persistence helpers.
-- `leaderboard.go`: High score tracking helpers.
-- `pubsub.go`: Subscribes to `game:*` channels and fans out updates.
-- `redis.go`: Redis client initialization and connectivity checks.
-- `Dockerfile`: Multi-stage build producing a minimal deployment image.
+### Environment variables
+- `REDIS_URL` – connection string understood by `redis.ParseURL` (defaults to `redis://localhost:6379`)
+- `PORT` – HTTP listen port (defaults to `8080`)
+
+### Run locally
+```bash
+export REDIS_URL=redis://localhost:6379
+export PORT=8080
+
+go run ./...
+```
+The server listens on `http://localhost:8080` and upgrades WebSocket connections at `/ws`.
+
+### Build a binary
+```bash
+go build -o tic-tac-toe-be
+./tic-tac-toe-be
+```
+
+### Docker
+```bash
+docker build -t tic-tac-toe-be .
+
+docker run --rm \
+  -p 8080:8080 \
+  -e REDIS_URL=redis://host.docker.internal:6379 \
+  tic-tac-toe-be
+```
+Adjust the Redis host for your setup (e.g. `redis://redis:6379` inside Docker Compose).
 
 ## Development Notes
-- Redis must be running before the server starts or the process exits.
-- `github.com/rs/cors` defaults allow all origins—tighten this for production.
-- No automated tests are provided yet; `go test ./...` is the expected entrypoint when they are added.
+- The process calls `initRedis()` on startup and exits if Redis is unreachable.
+- CORS is left permissive via `cors.Default()`. Restrict origins for production deployments.
+- There are no automated tests yet; `go test ./...` is the standard entrypoint once tests are added.
+- `FindMatchPayload` uses the shared `Message` envelope—ensure client payload keys match the JSON tags.
 
-Have fun building clients on top of the WebSocket API, and feel free to tailor the matchmaking or leaderboard logic to your needs.
+Build your client on top of the WebSocket API, or extend the matchmaking/leaderboard logic to fit your game variants.
